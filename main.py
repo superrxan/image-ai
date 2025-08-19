@@ -13,9 +13,11 @@ from openai import OpenAI
 from openai.types import CompletionUsage
 import re
 from tool_description import Message, ToolDefinition
+from typing import cast
+import mcp.types as types
+
 
 configure_logging(level="DEBUG")
-TAG = __name__
 logger = logging.getLogger(__name__)
 
 
@@ -48,43 +50,42 @@ async def on_mcp_disconnect(client, server_name):
 SERVER_NAME = "ESP32 Demo Server"
 
 
+from typing import Dict  # <-- Add this import at the top of your file if not present
+
+
 async def get_mcp_tools(
     mcp_client: mcp_mqtt.MqttTransportClient,
-) -> Dict[str, ToolDefinition]:
-    # Convert code to return type: Dict[str, ToolDefinition]
-    from typing import cast
-    import mcp.types as types
+) -> list[dict]:
+    """
+    获取 MCP 工具列表，并将其转换为可 JSON 序列化的字典列表。
+    """
 
-    tool_dict: Dict[str, ToolDefinition] = {}
+    tool_list: list[dict] = []
 
     try:
         tools_result = await mcp_client.list_tools(SERVER_NAME)
 
         if tools_result is False:
-            return tool_dict
+            return tool_list
 
         list_tools_result = cast(types.ListToolsResult, tools_result)
         tools = list_tools_result.tools
 
         for tool in tools:
-            logger.info(f"tool: {tool.name} - {tool.description}")
-            # ToolDefinition expects: name: str, description: Dict[str, Any], parameters: Optional[Dict[str, Any]]
-            # Assume tool.description is already a dict, otherwise adapt as needed
-            tool_def = ToolDefinition(
-                name=tool.name,
-                description=(
-                    tool.description
-                    if isinstance(tool.description, dict)
-                    else {"description": str(tool.description)}
-                ),
-                parameters=getattr(tool, "parameters", None),
-            )
-            tool_dict[tool.name] = tool_def
+            tool_def = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": getattr(tool, "inputSchema", None),
+                },
+            }
+            tool_list.append(tool_def)
 
     except Exception as e:
         logger.error(f"Get tool list error: {e}")
 
-    return tool_dict
+    return tool_list
 
 
 def extract_json_from_string(input_string):
@@ -131,12 +132,25 @@ class ConversationalAgent:
 
         self.dialogue: List[Message] = []
 
+        self.logger = logger
+
+        self.loop = asyncio.get_event_loop()
+
     def call_openai(self, query, functions=None):
         try:
-            self.dialogue.put(Message(role="user", content=query))
-            stream = self.client.chat.completions.create(
+            # Convert Message objects to dicts before sending to OpenAI
+            def message_to_dict(msg):
+                d = msg.__dict__.copy()
+                # Remove None values for OpenAI compatibility
+                return {k: v for k, v in d.items() if v is not None}
+
+            messages_payload = [message_to_dict(m) for m in self.dialogue]
+            messages_payload.append(
+                message_to_dict(Message(role="user", content=query))
+            )
+            stream = self.llm.chat.completions.create(
                 model=self.model_name,
-                messages=self.dialogue,
+                messages=messages_payload,
                 stream=True,
                 tools=functions,
             )
@@ -151,19 +165,17 @@ class ConversationalAgent:
                 # 存在 CompletionUsage 消息时，生成 Token 消耗 log
                 elif isinstance(getattr(chunk, "usage", None), CompletionUsage):
                     usage_info = getattr(chunk, "usage", None)
-                    logger.bind(tag=TAG).info(
+                    logger.info(
                         f"Token 消耗：输入 {getattr(usage_info, 'prompt_tokens', '未知')}，"
                         f"输出 {getattr(usage_info, 'completion_tokens', '未知')}，"
                         f"共计 {getattr(usage_info, 'total_tokens', '未知')}"
                     )
 
         except Exception as e:
-            logger.bind(tag=TAG).error(f"Error in function call streaming: {e}")
-            yield f"【OpenAI服务响应异常: {e}】", None
+            logger.error(f"Error in function call streaming: {e}")
 
     async def handle_llm_function_call(
         self,
-        mcp_client: mcp_mqtt.MqttTransportClient,
         function_call_data: Dict[str, Any],
     ) -> Optional[ActionResponse]:
         """处理LLM函数调用"""
@@ -185,24 +197,27 @@ class ConversationalAgent:
 
             self.logger.debug(f"调用函数: {function_name}, 参数: {arguments}")
 
-            # 执行工具调用
+            # 执行工具调用（需要等待协程完成）
             result = await self.mcp_client.call_tool(
                 SERVER_NAME, function_name, arguments
             )
-            return ActionResponse(action=Action.REQLLM, response=result)
+            return ActionResponse(action=Action.REQLLM, result=result)
 
         except Exception as e:
             self.logger.error(f"处理function call错误: {e}")
             return ActionResponse(action=Action.ERROR, response=str(e))
 
-    def _handle_function_result(self, result, function_call_data):
+    async def _handle_function_result(self, result, function_call_data):
         if result.action == Action.REQLLM:
             text = result.result
+
+            call_result = cast(types.CallToolResult, result)
+            text = call_result[0]
             if text is not None and len(text) > 0:
                 function_id = function_call_data["id"]
                 function_name = function_call_data["name"]
                 function_arguments = function_call_data["arguments"]
-                self.dialogue.put(
+                self.dialogue.append(
                     Message(
                         role="assistant",
                         tool_calls=[
@@ -223,7 +238,7 @@ class ConversationalAgent:
                     )
                 )
 
-                self.dialogue.put(
+                self.dialogue.append(
                     Message(
                         role="tool",
                         tool_call_id=(
@@ -232,18 +247,16 @@ class ConversationalAgent:
                         content=text,
                     )
                 )
-                return self.chat("请根据以上工具调用结果，回复用户")
+            res = await self.chat("请根据以上工具调用结果，回复用户")
+            return res
         else:
             pass
 
     async def chat(self, query) -> str:
-        try:
-            # Load tools and set to self.tools
-            tools = await get_mcp_tools(self.mcp_client) if self.mcp_client else {}
-            llm_responses = self.call_openai(query, tools)
-        except Exception as e:
-            logger.bind(tag=TAG).error(f"Error in function call streaming: {e}")
-            yield f"【OpenAI服务响应异常: {e}】", None
+
+        # Load tools and set to self.tools
+        tools = await get_mcp_tools(self.mcp_client) if self.mcp_client else {}
+        llm_responses = self.call_openai(query, tools)
 
         # 处理流式响应
         response_message = []
@@ -301,16 +314,14 @@ class ConversationalAgent:
                     bHasError = True
                     response_message.append(content_arguments)
                 if bHasError:
-                    self.logger.bind(tag=TAG).error(
-                        f"function call error: {content_arguments}"
-                    )
+                    self.logger.error(f"function call error: {content_arguments}")
             if not bHasError:
                 # 如需要大模型先处理一轮，添加相关处理后的日志情况
                 if len(response_message) > 0:
                     text_buff = "".join(response_message)
-                    self.dialogue.put(Message(role="assistant", content=text_buff))
+                    self.dialogue.append(Message(role="assistant", content=text_buff))
                 response_message.clear()
-                self.logger.bind(tag=TAG).debug(
+                self.logger.debug(
                     f"function_name={function_name}, function_id={function_id}, function_arguments={function_arguments}"
                 )
                 function_call_data = {
@@ -320,18 +331,15 @@ class ConversationalAgent:
                 }
 
                 # 使用统一工具处理器处理所有工具调用
-                result = asyncio.run_coroutine_threadsafe(
-                    self.handle_llm_function_call(self, function_call_data),
-                    self.loop,
-                ).result()
-                respon = self._handle_function_result(result, function_call_data)
+                result = await self.handle_llm_function_call(function_call_data)
+                respon = await self._handle_function_result(result, function_call_data)
                 response_message.append(respon)
 
         # 存储对话内容
         if len(response_message) > 0:
             text_buff = "".join(response_message)
             self.tts_MessageText = text_buff
-            self.dialogue.put(Message(role="assistant", content=text_buff))
+            self.dialogue.append(Message(role="assistant", content=text_buff))
 
         return text_buff
 
@@ -340,7 +348,7 @@ LLM = OpenAI(
     api_key=os.getenv("DASHSCOPE_API_KEY"),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",  # 填
 )
-MODEL_NAME = "qwen-omni-turbo"
+MODEL_NAME = "qwen-plus"
 
 
 async def main():
@@ -352,7 +360,7 @@ async def main():
             on_mcp_connect=on_mcp_connect,
             on_mcp_disconnect=on_mcp_disconnect,
             mqtt_options=mcp_mqtt.MqttOptions(
-                host="broker.emqx.io",
+                host="127.0.0.1",
             ),
         ) as mcp_client:
             await mcp_client.start()
@@ -372,12 +380,16 @@ async def main():
                         break
 
                     if user_input.lower() == "tools":
-                        print(f"available tools: {len(agent.tools)}")
-                        for tool in agent.tools:
-                            tool_name = getattr(tool.metadata, "name", str(tool))
-                            tool_desc = getattr(
-                                tool.metadata, "description", "No description"
-                            )
+                        # print(f"available tools: {len(agent.tools)}")
+                        tools = (
+                            await get_mcp_tools(agent.mcp_client)
+                            if agent.mcp_client
+                            else []
+                        )
+
+                        for tool in tools:
+                            tool_name = getattr(tool, "name", str(tool))
+                            tool_desc = getattr(tool, "description", "No description")
                             print(f"- {tool_name}: {tool_desc}")
                         continue
 

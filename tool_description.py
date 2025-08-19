@@ -12,7 +12,7 @@ class ToolDefinition:
     """工具定义"""
 
     name: str  # 工具名称
-    description: Dict[str, Any]  # 工具描述（OpenAI函数调用格式）
+    description: str  # 工具描述（OpenAI函数调用格式）
     parameters: Optional[Dict[str, Any]] = None  # 额外参数
 
 
