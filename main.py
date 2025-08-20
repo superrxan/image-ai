@@ -209,10 +209,8 @@ class ConversationalAgent:
 
     async def _handle_function_result(self, result, function_call_data):
         if result.action == Action.REQLLM:
-            text = result.result
-
-            call_result = cast(types.CallToolResult, result)
-            text = call_result[0]
+            call_result = cast(types.CallToolResult, result.result)
+            text = call_result.content
             if text is not None and len(text) > 0:
                 function_id = function_call_data["id"]
                 function_name = function_call_data["name"]
