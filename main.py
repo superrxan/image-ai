@@ -136,6 +136,24 @@ class ConversationalAgent:
 
         self.loop = asyncio.get_event_loop()
 
+        self.tools: List[Dict] = []
+
+    async def init(self):
+        tools = await get_mcp_tools(self.mcp_client) if self.mcp_client else []
+        self.tools = tools
+        self.dialogue.append(
+            Message(
+                role="system",
+                content="""
+                在这个对话中，你将扮演一个简单的情感助手。
+                你有视觉能力，当你被问 “你看看我今天打扮得怎么样”、“你看看我这件衣服是什么牌子的” 等视觉相关问题时，你可以调用 "explain_photo" 这个工具，
+                这个工具可以给主人拍摄一张照片，然后针对此照片做出评价，并将评价返回给你。
+                根据我提供的问题，生成一个简洁的回应。
+                请注意，回应的长度不应超过20个字符，内容应是对我的问题的情感分析或回应。
+                """,
+            )
+        )
+
     def call_openai(self, query, functions=None):
         try:
             # Convert Message objects to dicts before sending to OpenAI
@@ -365,6 +383,8 @@ async def main():
             await anyio.sleep(3)
 
             agent = ConversationalAgent(MODEL_NAME, LLM, mcp_client)
+
+            await agent.init()
 
             print("input 'exit' or 'quit' exit")
             print("input 'tools' show available tools")
