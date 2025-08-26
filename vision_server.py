@@ -56,7 +56,7 @@ async def process_audio(request: VisionRequest):
 
 def get_response(request: VisionRequest) -> VisionResponse:
     client = OpenAI(
-        api_key=os.getenv("DASHSCOPE_API_KEY"),
+        api_key="sk-9bc10e76aadb47d885b697c1ec029138",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     completion = client.chat.completions.create(
