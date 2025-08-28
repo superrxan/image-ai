@@ -9,6 +9,9 @@ from typing import Dict, Any, Callable, List, Union
 import asyncio
 from mcp_client_init import initialize_mcp_client, get_mcp_tools
 from lamindex import ConversationalAgent
+from llama_index.core.workflow import Context
+from lamindex import FuncCallEvent, MessageEvent
+
 
 # 配置日志
 logging.basicConfig(
@@ -169,36 +172,53 @@ class StdioClientForServer:
 
         logger.info(f"ASR识别结果: {recognized_text}")
 
-        # 等待 agent.chat 的响应，并将结果发送给服务器
-        # 解决办法：在子线程中不能直接用 asyncio.get_event_loop()，应新建一个事件循环
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            response = loop.run_until_complete(self.agent.chat(recognized_text))
-        finally:
-            loop.close()
-        self.send_to_server(
-            [
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tts_and_send",
-                    "params": {
-                        "device_id": device_id,
-                        "task_id": "aaa",
-                        "text": response,
-                    },
-                }
-            ]
-        )
-        self.send_to_server(
-            {
-                "jsonrpc": "2.0",
-                "id": self.unique_id,
-                "method": "tts_and_send_finish",
-                "params": {"device_id": device_id, "task_id": "aaa"},
-            }
-        )
+        async def _run_and_consume():
+            handler = self.agent.run(user_input=recognized_text)
+            async for ev in handler.stream_events():
+                if isinstance(ev, FuncCallEvent):
+                    obj = {
+                        "tool_name": ev.tool_name,
+                        "tool_kwargs": ev.tool_kwargs,
+                    }
+                    if ev.tool_output is not None:
+                        obj["tool_output"] = ev.tool_output
+                    self.send_to_server(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": self.unique_id,
+                            "method": "mcp_tool_calling",
+                            "obj": {
+                                "tool_name": ev.tool_name,
+                                "tool_kwargs": ev.tool_kwargs,
+                            },
+                        }
+                    )
+                elif isinstance(ev, MessageEvent):
+                    self.send_to_server(
+                        [
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tts_and_send",
+                                "params": {
+                                    "device_id": device_id,
+                                    "task_id": "aaa",
+                                    "text": ev.message,
+                                },
+                            }
+                        ]
+                    )
+                    self.send_to_server(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": self.unique_id,
+                            "method": "tts_and_send_finish",
+                            "params": {"device_id": device_id, "task_id": "aaa"},
+                        }
+                    )
+
+        asyncio.run(_run_and_consume())
+
         # 可以在这里发送客户端就绪消息
         # self.send_to_server(
         #     {

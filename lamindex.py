@@ -13,6 +13,15 @@ from llama_index.core.agent.workflow import (
     ToolCallResult,
 )
 
+from llama_index.core.workflow import (
+    Context,
+    Event,
+    StartEvent,
+    StopEvent,
+    Workflow,
+    step,
+)
+
 import mcp.client.mqtt as mcp_mqtt
 from mcp.shared.mqtt import configure_logging
 import mcp.types as types
@@ -23,6 +32,7 @@ from llama_index.core.tools import BaseTool, FunctionTool
 from llama_index.core.settings import Settings
 from llama_index.llms.openai_like import OpenAILike
 from pydantic import Field, create_model
+from llama_index.core.tools import ToolOutput
 
 configure_logging(level="DEBUG")
 logger = logging.getLogger(__name__)
@@ -187,8 +197,34 @@ def process_tool_output(response_text):
     return None
 
 
-class ConversationalAgent:
+def get_first_text_from_tool_output(tool_output: ToolOutput) -> str:
+    if tool_output is None or not hasattr(tool_output, "content"):
+        return ""
+    if hasattr(tool_output, "raw_output") and hasattr(
+        tool_output.raw_output, "content"
+    ):
+        content = tool_output.raw_output.content
+        if isinstance(content, list):
+            for item in content:
+                if hasattr(item, "type") and hasattr(item, "text"):
+                    return item.text
+    return ""
+
+
+class FuncCallEvent(Event):
+    tool_name: str
+    tool_kwargs: dict[str, Any]
+    tool_output: str | None
+
+
+class MessageEvent(Event):
+    message: str
+
+
+class ConversationalAgent(Workflow):
     def __init__(self, mcp_client: Optional[mcp_mqtt.MqttTransportClient] = None):
+        # Initialize base Workflow to set up dispatcher and internal state
+        super().__init__()
         # self.llm = SiliconFlow(
         #     api_key=api_key,
         #     model="deepseek-ai/DeepSeek-V3",
@@ -299,7 +335,47 @@ class ConversationalAgent:
             except Exception as e:
                 logger.error(f"load tool error: {e}")
 
-    async def chat(self, message: str) -> str:
+    # async def chat(self, message: str) -> str:
+    #     try:
+    #         if not self.mcp_tools_loaded:
+    #             await self.load_mcp_tools()
+
+    #         query_info = AgentWorkflow.from_tools_or_functions(
+    #             tools_or_functions=self.tools,
+    #             llm=self.llm,
+    #             system_prompt=self.system_prompt,
+    #             verbose=False,
+    #             timeout=180,
+    #         )
+
+    #         message = self._build_chat_messages(message)
+    #         handler = query_info.run(chat_history=message)
+
+    #         output = None
+    #         async for event in handler.stream_events():
+    #             if isinstance(event, AgentOutput):
+    #                 output = event.response
+    #         response = process_tool_output(output)
+
+    #         logger.info(f"Agent response: {response}")
+    #         return str(response)
+
+    #     except Exception as e:
+    #         error_msg = f"error: {e}"
+    #         logger.error(error_msg)
+    #         return error_msg
+
+    def _emit_func_call_event(
+        self, ctx: Context, name: str, args: dict[str, Any], result: str | None = None
+    ) -> None:
+        """Helper method to emit FuncCallEvent consistently across methods."""
+        func_call_event = FuncCallEvent(
+            tool_name=name, tool_kwargs=args, tool_output=result
+        )
+        ctx.write_event_to_stream(func_call_event)
+
+    @step
+    async def chat(self, ctx: Context, ev: StartEvent) -> StopEvent:
         try:
             if not self.mcp_tools_loaded:
                 await self.load_mcp_tools()
@@ -312,22 +388,28 @@ class ConversationalAgent:
                 timeout=180,
             )
 
-            message = self._build_chat_messages(message)
+            message = self._build_chat_messages(ev.user_input)
             handler = query_info.run(chat_history=message)
 
             output = None
             async for event in handler.stream_events():
                 if isinstance(event, AgentOutput):
                     output = event.response
-            response = process_tool_output(output)
+                    response = process_tool_output(output)
+                    logger.info(f"Agent response: {response}")
+                    ctx.write_event_to_stream(MessageEvent(message=response))
+                elif isinstance(event, ToolCallResult):
+                    text = get_first_text_from_tool_output(event.tool_output)
+                    self._emit_func_call_event(
+                        ctx, event.tool_name, event.tool_kwargs, text
+                    )
 
-            logger.info(f"Agent response: {response}")
-            return str(response)
+            return StopEvent
 
         except Exception as e:
             error_msg = f"error: {e}"
             logger.error(error_msg)
-            return error_msg
+            return StopEvent
 
 
 async def main():
@@ -373,8 +455,7 @@ async def main():
                     if not user_input:
                         continue
 
-                    response = await agent.chat(user_input)
-                    print(f"\nAgent: {response}")
+                    handler = agent.chat(user_input)
 
                 except KeyboardInterrupt:
                     break
