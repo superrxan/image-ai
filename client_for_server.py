@@ -46,7 +46,7 @@ class StdioClientForServer:
             "shutdown": self.handle_shutdown,
             "server_ready": self.handle_server_ready,
             # 以下才是有真实数据的服务端返回
-            "asr_reusult": self.handle_asr_result,
+            "asr_result": self.handle_asr_result,
         }
 
     def _register_default_handlers(self):
@@ -451,6 +451,7 @@ def create_agent():
         )
 
         agent = ConversationalAgent(mcp_client=mcp_client)
+        await agent.load_mcp_tools()
         return agent
 
     # 在主线程中初始化（阻塞直到完成）

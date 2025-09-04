@@ -33,6 +33,7 @@ from llama_index.core.settings import Settings
 from llama_index.llms.openai_like import OpenAILike
 from pydantic import Field, create_model
 from llama_index.core.tools import ToolOutput
+from openai import OpenAI
 
 configure_logging(level="DEBUG")
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ async def on_mcp_disconnect(client, server_name):
 
 
 client = None
-api_key = "sk-zqfstppriuodtmyyamkkynwebzccykxjyhqepguyuomiugky"
+api_key = "sk-******"
 
 
 def build_fn_schema_from_input_schema(model_name: str, input_schema: dict):
@@ -192,9 +193,56 @@ async def get_mcp_tools(mcp_client: mcp_mqtt.MqttTransportClient) -> List[BaseTo
 
 def process_tool_output(response_text):
     if hasattr(response_text, "content"):
-        response_text = response_text.content
-        return response_text
+        return response_text.content
     return None
+
+
+def explain_photo(image_url: str, question: str) -> str:
+    """Explain the photo by the question. Used when users ask a question about the photo. The image_url is the url of the image."""
+
+    request_body = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": image_url},
+            },
+            {"type": "text", "text": question},
+        ],
+    }
+
+    client = OpenAI(
+        api_key="sk-******",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    completion = client.chat.completions.create(
+        model="qwen-vl-plus",
+        messages=[request_body],
+    )
+    # 提取第一个 choice 的 message.content 字段
+    content = ""
+    if completion.choices and hasattr(completion.choices[0], "message"):
+        content = completion.choices[0].message.content
+    return content
+
+
+def add_explain_photo_tool(self):
+    self.tools.append(
+        FunctionTool.from_defaults(
+            fn=explain_photo,
+            name="explain_photo",
+            description="Explain the photo by the question. Used when users ask a question about the photo. The image_url is the url of the image.",
+            async_fn=explain_photo,
+            fn_schema={
+                "type": "object",
+                "properties": {
+                    "image_url": {"type": "string"},
+                    "question": {"type": "string"},
+                },
+                "required": ["image_url", "question"],
+            },
+        )
+    )
 
 
 def get_first_text_from_tool_output(tool_output: ToolOutput) -> str:
@@ -235,7 +283,7 @@ class ConversationalAgent(Workflow):
 
         self.llm = OpenAILike(
             model="qwen-plus",
-            api_key="sk-9bc10e76aadb47d885b697c1ec029138",
+            api_key="sk-******",
             api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
             is_chat_model=True,
             is_function_calling_model=True,
@@ -259,8 +307,8 @@ class ConversationalAgent(Workflow):
 
         self.system_prompt = """
                 在这个对话中，你将扮演一个情感助手。
-                你有视觉能力，当你被问 “你看看我今天打扮得怎么样”、“你看看我这件衣服是什么牌子的” 等视觉相关问题时，你可以调用 "explain_photo" 这个工具，
-                这个工具可以给主人拍摄一张照片，然后针对此照片做出评价，并将评价返回给你。
+                你有视觉能力，当你被问 “你看看我今天打扮得怎么样”、“你看看我这件衣服是什么牌子的” 等视觉相关问题时，你可以先调用 "take_photo" 这个工具得到一张图片，
+                然后将获得的图片和用户的问题作为参数传给 "explain_photo" 这个工具，针对此照片做出评价，并将评价返回给你。
                 根据我提供的问题，生成一个富有温度的回应。注意少于 50 个字符。
                 """
 
@@ -327,6 +375,7 @@ class ConversationalAgent(Workflow):
                 mcp_tools = await get_mcp_tools(self.mcp_client)
                 if mcp_tools:
                     self.tools.extend(mcp_tools)
+                    add_explain_photo_tool(self)
                     # self.agent = AgentRunner.from_llm(
                     #     llm=self.llm, tools=self.tools, verbose=True
                     # )
